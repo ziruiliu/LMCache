@@ -20,6 +20,7 @@ class LookupClientInterface(metaclass=abc.ABCMeta):
         token_ids: Union[torch.Tensor, list[int]],
         lookup_id: str,
         request_configs: Optional[dict] = None,
+        skip_n_tokens: int = 0,
     ) -> Optional[int]:
         """
         Perform lookup for the given token IDs.
@@ -31,6 +32,9 @@ class LookupClientInterface(metaclass=abc.ABCMeta):
 
             request_configs: The configs of the request,
             includes tags and the other configs
+
+            skip_n_tokens: Number of prefix tokens (aligned to chunk size)
+                that should be skipped when checking cache existence.
 
         Returns:
             The number of tokens that can be loaded from cache.
