@@ -477,6 +477,7 @@ class StorageManager:
         task: asyncio.Future,
         lookup_id: str,
         cum_last_tier_chunk_lengths: list[int],
+        base_offset: int = 0,
     ) -> None:
         """
         Callback function when all prefetch tasks
@@ -488,7 +489,9 @@ class StorageManager:
         )
         res = task.result()
         last_tier_retrieved_chunks = len(res[-1])
-        retrieved_length = cum_last_tier_chunk_lengths[last_tier_retrieved_chunks]
+        retrieved_length = (
+            cum_last_tier_chunk_lengths[last_tier_retrieved_chunks] + base_offset
+        )
         logger.info(
             f"Responding to scheduler for lookup id {lookup_id}"
             f" with retrieved length {retrieved_length}"
@@ -502,6 +505,7 @@ class StorageManager:
         cum_chunk_lengths: list[int],
         search_range: Optional[list[str]] = None,
         pin: bool = False,
+        base_offset: int = 0,
     ) -> None:
         """
         Perform asynchronous lookup and prefetching across all storage backends.
@@ -513,6 +517,9 @@ class StorageManager:
         to search in. Should be a subset of ["LocalCPUBackend",
         "LocalDiskBackend"] for now. If None, search in all backends.
         :param bool pin: Whether to pin the keys.
+        :param int base_offset: Number of tokens guaranteed to be cached
+            before the provided keys. These tokens will be included when
+            responding to the scheduler.
         """
 
         # NOTE(Jiayi): Currently, the retrieval pattern is always
@@ -576,7 +583,9 @@ class StorageManager:
         # If no chunks were hit across all backends, respond immediately and return.
         if num_total_hit_chunks == 0:
             if self.async_lookup_server is not None:
-                self.async_lookup_server.send_response_to_scheduler(lookup_id, 0)
+                self.async_lookup_server.send_response_to_scheduler(
+                    lookup_id, base_offset
+                )
             return
 
         all_done = asyncio.gather(*loading_tasks)
@@ -594,6 +603,7 @@ class StorageManager:
                 cum_chunk_lengths_total[
                     num_total_hit_chunks - num_last_tier_hit_chunks :
                 ],
+                base_offset,
             )
         )
 

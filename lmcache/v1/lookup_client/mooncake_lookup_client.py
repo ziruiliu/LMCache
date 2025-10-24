@@ -61,6 +61,7 @@ class MooncakeLookupClient(LookupClientInterface):
         token_ids: Union[torch.Tensor, list[int]],
         lookup_id: Optional[str] = None,
         request_configs: Optional[dict] = None,
+        skip_n_tokens: int = 0,
     ) -> Optional[int]:
         # process token_ids to cacheengine keys
         keys = []
@@ -70,9 +71,23 @@ class MooncakeLookupClient(LookupClientInterface):
             keys.append(key.to_string())
             ends.append(end)
 
+        skip_index = 0
+        for end in ends:
+            if end <= skip_n_tokens:
+                skip_index += 1
+            else:
+                break
+
+        base = ends[skip_index - 1] if skip_index > 0 else 0
+        remaining_keys = keys[skip_index:]
+        remaining_ends = ends[skip_index:]
+
+        if not remaining_keys:
+            return base
+
         # Use batch_is_exist to check all keys at once
         # rets is list of int: 1 = found, 0 = not found, -1 = error
-        rets = self.store.batch_is_exist(keys)
+        rets = self.store.batch_is_exist(remaining_keys)
 
         # Find the first key that doesn't exist (ret != 1)
         # This follows the same logic as cache engine's lookup method
@@ -80,10 +95,14 @@ class MooncakeLookupClient(LookupClientInterface):
             if ret != 1:  # Not found or error
                 # Return the end position of the previous chunk
                 # If i == 0, no chunks were found, return 0
-                return ends[i - 1] if i > 0 else 0
+                return (
+                    remaining_ends[i - 1]
+                    if i > 0
+                    else base
+                )
 
         # All keys were found, return the last end position
-        return ends[-1] if ends else 0
+        return remaining_ends[-1] if remaining_ends else base
 
     def supports_producer_reuse(self) -> bool:
         """Return True as MooncakeLookupClient supports producer kvcache reuse"""

@@ -1176,6 +1176,11 @@ class LMCacheConnectorV1Impl:
             token_ids,
             lookup_id=lookup_id,
             request_configs=request_configs,
+            skip_n_tokens=(
+                num_computed_tokens
+                // self._lmcache_chunk_size
+                * self._lmcache_chunk_size
+            ),
         )
 
         if num_external_hit_tokens is None:

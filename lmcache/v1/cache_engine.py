@@ -657,6 +657,7 @@ class LMCacheEngine:
         lookup_id: Optional[str] = None,
         pin: bool = False,
         request_configs: Optional[dict] = None,
+        skip_n_tokens: int = 0,
     ) -> int:
         """
         Checks the existence of KV cache of the tokens from the cache engine.
@@ -681,6 +682,9 @@ class LMCacheEngine:
 
         :param Optional[dict] request_configs: the configs of the request.
 
+        :param int skip_n_tokens: Number of prefix tokens (aligned to chunk
+            boundaries) that can be skipped when checking cache existence.
+
         :return: An int indicating how many prefix tokens are cached.
         """
 
@@ -692,17 +696,40 @@ class LMCacheEngine:
             lookup_request_id = self.stats_monitor.on_lookup_request(sum(offsets))
 
         res = 0
+        skip_n_tokens = max(skip_n_tokens, 0)
         try:
-            chunk_info_iterator = self.token_database.process_tokens(
-                tokens=tokens,
-                hashes=hashes,
-                offsets=offsets,
-                request_configs=request_configs,
+            chunk_info_list = list(
+                self.token_database.process_tokens(
+                    tokens=tokens,
+                    hashes=hashes,
+                    offsets=offsets,
+                    request_configs=request_configs,
+                )
             )
+
+            if not chunk_info_list:
+                return 0
+
+            total_tokens = chunk_info_list[-1][1]
+            effective_skip = min(skip_n_tokens, total_tokens)
+
+            skip_index = 0
+            total_chunks = len(chunk_info_list)
+            while (
+                skip_index < total_chunks
+                and chunk_info_list[skip_index][1] <= effective_skip
+            ):
+                skip_index += 1
+
+            res = chunk_info_list[skip_index - 1][1] if skip_index > 0 else 0
+            chunk_info_to_check = chunk_info_list[skip_index:]
+
+            if not chunk_info_to_check:
+                return res
 
             # TODO: support batched_contains when layerwise is enabled
             if self.use_layerwise:
-                for start, end, key in chunk_info_iterator:
+                for start, end, key in chunk_info_to_check:
                     assert isinstance(key, CacheEngineKey)
 
                     # TODO(Jiayi): Optimize by checking only the existence of the key
@@ -727,19 +754,13 @@ class LMCacheEngine:
                         continue
                     return res
             else:
-                chunk_info_list = []
-                keys = []
-                for chunk_info in chunk_info_iterator:
-                    assert isinstance(chunk_info[2], CacheEngineKey)
-                    chunk_info_list.append(chunk_info)
-                    keys.append(chunk_info[2])
-
+                keys = [chunk_info[2] for chunk_info in chunk_info_to_check]
                 batched_contains_res = self.storage_manager.batched_contains(
                     keys, search_range, pin, True
                 )
-                assert len(batched_contains_res) == len(chunk_info_list)
+                assert len(batched_contains_res) == len(chunk_info_to_check)
                 for (start, end, key), exists in zip(
-                    chunk_info_list, batched_contains_res, strict=False
+                    chunk_info_to_check, batched_contains_res, strict=False
                 ):
                     if exists:
                         if pin:
@@ -751,7 +772,7 @@ class LMCacheEngine:
                         continue
                     return res
 
-            # all tokens where found, return the maximal end
+            # all tokens were found, return the maximal end
             return res
         finally:
             self.stats_monitor.on_lookup_finished(lookup_request_id, res)
@@ -834,6 +855,7 @@ class LMCacheEngine:
         search_range: Optional[List[str]] = None,
         pin: bool = False,
         request_configs: Optional[dict] = None,
+        skip_n_tokens: int = 0,
     ) -> None:
         """
         An async version of lookup + prefetch.
@@ -844,23 +866,59 @@ class LMCacheEngine:
         (3) async lookup + async retrieval (e.g., p2p)
         """
 
+        chunk_info_list = list(
+            self.token_database.process_tokens(
+                tokens=tokens,
+                hashes=hashes,
+                offsets=offsets,
+                request_configs=request_configs,
+            )
+        )
+
+        if not chunk_info_list:
+            if skip_n_tokens > 0 and self.async_lookup_server is not None:
+                self.async_lookup_server.send_response_to_scheduler(
+                    lookup_id, 0
+                )
+            return
+
+        total_tokens = chunk_info_list[-1][1]
+        effective_skip = min(max(skip_n_tokens, 0), total_tokens)
+
+        skip_index = 0
+        total_chunks = len(chunk_info_list)
+        while (
+            skip_index < total_chunks
+            and chunk_info_list[skip_index][1] <= effective_skip
+        ):
+            skip_index += 1
+
+        base_offset = chunk_info_list[skip_index - 1][1] if skip_index > 0 else 0
+        chunk_info_to_prefetch = chunk_info_list[skip_index:]
+
+        if not chunk_info_to_prefetch:
+            if self.async_lookup_server is not None:
+                self.async_lookup_server.send_response_to_scheduler(
+                    lookup_id, base_offset
+                )
+            return
+
         keys: list[CacheEngineKey] = []
         cum_chunk_lengths = [0]
 
-        # TODO(Jiayi): make token database able to return list.
-        for start, end, key in self.token_database.process_tokens(
-            tokens=tokens,
-            hashes=hashes,
-            offsets=offsets,
-            request_configs=request_configs,
-        ):
+        for _, end, key in chunk_info_to_prefetch:
             assert isinstance(key, CacheEngineKey)
             keys.append(key)
-            cum_chunk_lengths.append(end)
+            cum_chunk_lengths.append(end - base_offset)
 
         asyncio.run_coroutine_threadsafe(
             self.storage_manager.async_lookup_and_prefetch(
-                lookup_id, keys, cum_chunk_lengths, search_range, pin
+                lookup_id,
+                keys,
+                cum_chunk_lengths,
+                search_range,
+                pin,
+                base_offset,
             ),
             self.storage_manager.loop,
         )

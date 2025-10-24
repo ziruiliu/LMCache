@@ -148,6 +148,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         token_ids: Union[torch.Tensor, list[int]],
         lookup_id: str,
         request_configs: Optional[dict] = None,
+        skip_n_tokens: int = 0,
     ) -> Optional[int]:
         with self.lock:
             # -1 indicates not found; None indicates ongoing.
@@ -175,11 +176,13 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                 [f"{k}%{v}" for k, v in request_configs.items()]
             )
         request_configs_buf = request_configs_str.encode("utf-8")
+        skip_buf = skip_n_tokens.to_bytes(8, "big", signed=False)
 
         msg_buf = [
             lookup_id_buf,
             hash_buf,
             offset_buf,
+            skip_buf,
             request_configs_buf,
         ]
 
@@ -281,8 +284,8 @@ class LMCacheAsyncLookupServer:
         )
         self.thread.start()
 
-        # The four parts are [hash, offset, lookup_id, request_configs]
-        self.num_parts = 4
+        # The five parts are [lookup_id, hash, offset, skip, request_configs]
+        self.num_parts = 5
 
     def process_requests_from_scheduler(self):
         while self.running:
@@ -298,7 +301,10 @@ class LMCacheAsyncLookupServer:
                 offset_frame = frames[i + 2]
                 offsets = self.decoder.decode(offset_frame)
 
-                request_configs_str = frames[i + 3].bytes.decode("utf-8")
+                skip_frame = frames[i + 3]
+                skip_n_tokens = int.from_bytes(skip_frame, "big", signed=False)
+
+                request_configs_str = frames[i + 4].bytes.decode("utf-8")
                 request_configs = None
                 if request_configs_str != "":
                     request_configs = {}
@@ -315,6 +321,7 @@ class LMCacheAsyncLookupServer:
                     offsets=offsets,
                     pin=True,
                     request_configs=request_configs,
+                    skip_n_tokens=skip_n_tokens,
                 )
 
     def send_response_to_scheduler(self, lookup_id: str, num_hit_tokens: int):
