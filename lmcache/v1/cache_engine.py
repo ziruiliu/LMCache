@@ -655,6 +655,7 @@ class LMCacheEngine:
         lookup_id: Optional[str] = None,
         pin: bool = False,
         request_configs: Optional[dict] = None,
+        skip_n_tokens: int = 0,
     ) -> int:
         """
         Checks the existence of KV cache of the tokens from the cache engine.
@@ -679,17 +680,27 @@ class LMCacheEngine:
 
         :param Optional[dict] request_configs: the configs of the request.
 
+        :param int skip_n_tokens: Number of leading tokens that can be skipped
+            during lookup because they are already available to the caller.
+
         :return: An int indicating how many prefix tokens are cached.
         """
 
         if tokens is not None:
-            lookup_request_id = self.stats_monitor.on_lookup_request(len(tokens))
+            total_length = len(tokens)
         else:
             assert offsets is not None
             assert hashes is not None
-            lookup_request_id = self.stats_monitor.on_lookup_request(sum(offsets))
+            total_length = sum(offsets)
 
-        res = 0
+        skip_n_tokens = max(0, min(skip_n_tokens, total_length))
+
+        if tokens is not None:
+            lookup_request_id = self.stats_monitor.on_lookup_request(total_length)
+        else:
+            lookup_request_id = self.stats_monitor.on_lookup_request(total_length)
+
+        res = skip_n_tokens
         try:
             chunk_info_iterator = self.token_database.process_tokens(
                 tokens=tokens,
@@ -701,6 +712,16 @@ class LMCacheEngine:
             # TODO: support batched_contains when layerwise is enabled
             if self.use_layerwise:
                 for start, end, key in chunk_info_iterator:
+                    if end <= skip_n_tokens:
+                        continue
+                    if start < skip_n_tokens < end:
+                        logger.warning(
+                            "skip_n_tokens %d is not aligned with chunk boundary: %s-%s",
+                            skip_n_tokens,
+                            start,
+                            end,
+                        )
+                        continue
                     assert isinstance(key, CacheEngineKey)
 
                     # TODO(Jiayi): Optimize by checking only the existence of the key
@@ -729,8 +750,22 @@ class LMCacheEngine:
                 keys = []
                 for chunk_info in chunk_info_iterator:
                     assert isinstance(chunk_info[2], CacheEngineKey)
+                    start, end, _ = chunk_info
+                    if end <= skip_n_tokens:
+                        continue
+                    if start < skip_n_tokens < end:
+                        logger.warning(
+                            "skip_n_tokens %d is not aligned with chunk boundary: %s-%s",
+                            skip_n_tokens,
+                            start,
+                            end,
+                        )
+                        continue
                     chunk_info_list.append(chunk_info)
                     keys.append(chunk_info[2])
+
+                if not chunk_info_list:
+                    return res
 
                 batched_contains_res = self.storage_manager.batched_contains(
                     keys, search_range, pin, True
@@ -832,6 +867,7 @@ class LMCacheEngine:
         search_range: Optional[List[str]] = None,
         pin: bool = False,
         request_configs: Optional[dict] = None,
+        skip_n_tokens: int = 0,
     ) -> None:
         """
         An async version of lookup + prefetch.
@@ -842,8 +878,15 @@ class LMCacheEngine:
         (3) async lookup + async retrieval (e.g., p2p)
         """
 
+        if tokens is not None:
+            total_length = len(tokens)
+        else:
+            assert offsets is not None
+            total_length = sum(offsets)
+
+        skip_n_tokens = max(0, min(skip_n_tokens, total_length))
         keys: list[CacheEngineKey] = []
-        cum_chunk_lengths = [0]
+        cum_chunk_lengths = [skip_n_tokens]
 
         # TODO(Jiayi): make token database able to return list.
         for start, end, key in self.token_database.process_tokens(
@@ -852,9 +895,26 @@ class LMCacheEngine:
             offsets=offsets,
             request_configs=request_configs,
         ):
+            if end <= skip_n_tokens:
+                continue
+            if start < skip_n_tokens < end:
+                logger.warning(
+                    "skip_n_tokens %d is not aligned with chunk boundary: %s-%s",
+                    skip_n_tokens,
+                    start,
+                    end,
+                )
+                continue
             assert isinstance(key, CacheEngineKey)
             keys.append(key)
             cum_chunk_lengths.append(end)
+
+        if not keys:
+            if self.storage_manager.async_lookup_server is not None:
+                self.storage_manager.async_lookup_server.send_response_to_scheduler(
+                    lookup_id, skip_n_tokens
+                )
+            return
 
         asyncio.run_coroutine_threadsafe(
             self.storage_manager.async_lookup_and_prefetch(
