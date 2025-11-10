@@ -1326,8 +1326,8 @@ class LMCacheConnectorV1Impl:
             need_to_allocate -= 1
 
         logger.info(
-            "Reqid: %s, Total tokens %d, LMCache hit tokens: %d "
-            " in vLLM %d, need to load: %d",
+            "Reqid: %s, Total tokens %d, LMCache hit tokens: %d, "
+            "in vLLM: %d, need to load: %d",
             request.request_id,
             request.num_tokens,
             num_external_hit_tokens,
