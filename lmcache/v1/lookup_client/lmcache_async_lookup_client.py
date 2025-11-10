@@ -152,6 +152,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         token_ids: Union[torch.Tensor, list[int]],
         lookup_id: str,
         request_configs: Optional[dict] = None,
+        num_computed_tokens: int = 0,
     ) -> Optional[int]:
         with self.lock:
             # -1 indicates not found; None indicates ongoing.
@@ -174,6 +175,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
 
         lookup_id_buf = lookup_id.encode("utf-8")
         request_configs_str = ""
+        num_computed_buf = num_computed_tokens.to_bytes(8, "big", signed=False)
         if request_configs is not None and len(request_configs) != 0:
             request_configs_str = "@".join(
                 [f"{k}%{v}" for k, v in request_configs.items()]
@@ -182,6 +184,7 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
 
         msg_buf = [
             lookup_id_buf,
+            num_computed_buf,
             hash_buf,
             offset_buf,
             request_configs_buf,
@@ -280,8 +283,9 @@ class LMCacheAsyncLookupServer:
         )
         self.thread.start()
 
-        # The four parts are [hash, offset, lookup_id, request_configs]
-        self.num_parts = 4
+        # The five parts are
+        # [lookup_id, num_computed_tokens, hash, offset, request_configs]
+        self.num_parts = 5
 
     def process_requests_from_scheduler(self):
         while self.running:
@@ -290,14 +294,15 @@ class LMCacheAsyncLookupServer:
             assert num_frames % self.num_parts == 0
             for i in range(0, num_frames, self.num_parts):
                 lookup_id = frames[i].bytes.decode("utf-8")
-
-                hash_frame = frames[i + 1]
+                num_computed_tokens_frame = frames[i + 1]
+                num_computed_tokens = int.from_bytes(num_computed_tokens_frame, "big")
+                hash_frame = frames[i + 2]
                 hashes = self.decoder.decode(hash_frame)
 
-                offset_frame = frames[i + 2]
+                offset_frame = frames[i + 3]
                 offsets = self.decoder.decode(offset_frame)
 
-                request_configs_str = frames[i + 3].bytes.decode("utf-8")
+                request_configs_str = frames[i + 4].bytes.decode("utf-8")
                 request_configs = None
                 if request_configs_str != "":
                     request_configs = {}
@@ -314,6 +319,7 @@ class LMCacheAsyncLookupServer:
                     offsets=offsets,
                     pin=True,
                     request_configs=request_configs,
+                    num_computed_tokens=num_computed_tokens,
                 )
 
     def send_response_to_scheduler(self, lookup_id: str, num_hit_tokens: int):
