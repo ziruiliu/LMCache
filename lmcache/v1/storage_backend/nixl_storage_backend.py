@@ -1121,8 +1121,6 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         )
 
         if self.async_mode:
-            for mem_obj in mem_objs:
-                mem_obj.ref_count_up()
             initial_state = self.agent.post_async(handle)
             # Submit the async wait to the event loop and return immediately
             asyncio.create_task(
@@ -1233,6 +1231,8 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
                 self.progress_set.add(key)
 
         if self.async_mode:
+            for mem_obj in memory_objs:
+                mem_obj.ref_count_up()
             asyncio.run_coroutine_threadsafe(
                 self.mem_to_storage(keys, memory_objs), self.loop
             )
