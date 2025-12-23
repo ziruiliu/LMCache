@@ -159,6 +159,8 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         # works with a single device?
         self.kv_cache_pointers_on_gpu: dict[int, torch.Tensor] = {}
         self.page_buffer_size = 0
+        self.page_size = 0
+        self.kv_cache_kv_second = False
 
         self.kvcaches: Optional[List[torch.Tensor]] = None
 
@@ -230,10 +232,30 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             # kv_caches[0].shape: [num_pages, page_size, head_size]
             assert kv_caches[0].dim() == 3
             self.page_buffer_size = kv_caches[0].shape[0] * kv_caches[0].shape[1]
+            self.page_size = kv_caches[0].shape[1]
+            self.kv_cache_kv_second = False
         else:
-            # kv_caches[0].shape: [2, num_pages, page_size, num_heads, head_size]
             assert kv_caches[0].dim() == 5
-            self.page_buffer_size = kv_caches[0].shape[1] * kv_caches[0].shape[2]
+            if kv_caches[0].shape[0] == 2:
+                # kv_caches[0].shape: [2, num_pages, page_size, num_heads, head_size]
+                self.page_buffer_size = (
+                    kv_caches[0].shape[1] * kv_caches[0].shape[2]
+                )
+                self.page_size = kv_caches[0].shape[2]
+                self.kv_cache_kv_second = False
+            elif kv_caches[0].shape[1] == 2:
+                # kv_caches[0].shape: [num_pages, 2, page_size, num_heads, head_size]
+                self.page_buffer_size = (
+                    kv_caches[0].shape[0] * kv_caches[0].shape[2]
+                )
+                self.page_size = kv_caches[0].shape[2]
+                self.kv_cache_kv_second = True
+            else:
+                raise ValueError(
+                    "Unexpected kv cache layout. Expected shape [2, num_pages, "
+                    "page_size, num_heads, head_size] or [num_pages, 2, "
+                    "page_size, num_heads, head_size]."
+                )
 
         return self.kv_cache_pointers_on_gpu[idx]
 
@@ -283,15 +305,27 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
-        lmc_ops.multi_layer_kv_transfer(
-            memory_obj.tensor,
-            kv_cache_pointers,
-            slot_mapping[start:end],
-            self.device,
-            self.page_buffer_size,
-            False,
-            self.use_mla,
-        )
+        if self.kv_cache_kv_second:
+            lmc_ops.multi_layer_kv_transfer_kv_second(
+                memory_obj.tensor,
+                kv_cache_pointers,
+                slot_mapping[start:end],
+                self.device,
+                self.page_buffer_size,
+                self.page_size,
+                False,
+                self.use_mla,
+            )
+        else:
+            lmc_ops.multi_layer_kv_transfer(
+                memory_obj.tensor,
+                kv_cache_pointers,
+                slot_mapping[start:end],
+                self.device,
+                self.page_buffer_size,
+                False,
+                self.use_mla,
+            )
 
     @_lmcache_nvtx_annotate
     def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -328,28 +362,52 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         with torch.cuda.stream(self.store_stream):
             if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
-                lmc_ops.multi_layer_kv_transfer(
-                    memory_obj.tensor,
-                    kv_cache_pointers,
-                    slot_mapping[start:end],
-                    self.kvcaches[0].device,
-                    self.page_buffer_size,
-                    True,
-                    self.use_mla,
-                )
+                if self.kv_cache_kv_second:
+                    lmc_ops.multi_layer_kv_transfer_kv_second(
+                        memory_obj.tensor,
+                        kv_cache_pointers,
+                        slot_mapping[start:end],
+                        self.kvcaches[0].device,
+                        self.page_buffer_size,
+                        self.page_size,
+                        True,
+                        self.use_mla,
+                    )
+                else:
+                    lmc_ops.multi_layer_kv_transfer(
+                        memory_obj.tensor,
+                        kv_cache_pointers,
+                        slot_mapping[start:end],
+                        self.kvcaches[0].device,
+                        self.page_buffer_size,
+                        True,
+                        self.use_mla,
+                    )
             else:
                 # kvcaches -> gpu_buffer -> memobj
                 assert self.gpu_buffer.device == self.kvcaches[0].device
                 tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
-                lmc_ops.multi_layer_kv_transfer(
-                    tmp_gpu_buffer,
-                    kv_cache_pointers,
-                    slot_mapping[start:end],
-                    self.kvcaches[0].device,
-                    self.page_buffer_size,
-                    True,
-                    self.use_mla,
-                )
+                if self.kv_cache_kv_second:
+                    lmc_ops.multi_layer_kv_transfer_kv_second(
+                        tmp_gpu_buffer,
+                        kv_cache_pointers,
+                        slot_mapping[start:end],
+                        self.kvcaches[0].device,
+                        self.page_buffer_size,
+                        self.page_size,
+                        True,
+                        self.use_mla,
+                    )
+                else:
+                    lmc_ops.multi_layer_kv_transfer(
+                        tmp_gpu_buffer,
+                        kv_cache_pointers,
+                        slot_mapping[start:end],
+                        self.kvcaches[0].device,
+                        self.page_buffer_size,
+                        True,
+                        self.use_mla,
+                    )
                 memory_obj.tensor.copy_(tmp_gpu_buffer, non_blocking=True)
 
         if not memory_obj.tensor.is_cuda:
@@ -393,6 +451,8 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         self.use_gpu = use_gpu
         self.kvcaches: Optional[List[torch.Tensor]] = None
         self.page_buffer_size = 0
+        self.page_size = 0
+        self.kv_cache_kv_second = False
         self.group_layers: Optional[list[int]] = None
         self.group_hidden_dim_sizes: Optional[list[int]] = None
         self.group_kv_cache_pointers_on_gpu: Optional[list[torch.Tensor]] = None
@@ -478,12 +538,30 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             self.page_buffer_size = (
                 self.kvcaches[0].shape[0] * self.kvcaches[0].shape[1]
             )
+            self.page_size = self.kvcaches[0].shape[1]
+            self.kv_cache_kv_second = False
         else:
-            # kvcaches[0].shape: [2, num_pages, page_size, num_heads, head_size]
             assert self.kvcaches[0].dim() == 5
-            self.page_buffer_size = (
-                self.kvcaches[0].shape[1] * self.kvcaches[0].shape[2]
-            )
+            if self.kvcaches[0].shape[0] == 2:
+                # kvcaches[0].shape: [2, num_pages, page_size, num_heads, head_size]
+                self.page_buffer_size = (
+                    self.kvcaches[0].shape[1] * self.kvcaches[0].shape[2]
+                )
+                self.page_size = self.kvcaches[0].shape[2]
+                self.kv_cache_kv_second = False
+            elif self.kvcaches[0].shape[1] == 2:
+                # kvcaches[0].shape: [num_pages, 2, page_size, num_heads, head_size]
+                self.page_buffer_size = (
+                    self.kvcaches[0].shape[0] * self.kvcaches[0].shape[2]
+                )
+                self.page_size = self.kvcaches[0].shape[2]
+                self.kv_cache_kv_second = True
+            else:
+                raise ValueError(
+                    "Unexpected kv cache layout. Expected shape [2, num_pages, "
+                    "page_size, num_heads, head_size] or [num_pages, 2, "
+                    "page_size, num_heads, head_size]."
+                )
         logger.info("init kv cache pointers success in VLLMPagedMemGPUConnectorV3")
 
     @_lmcache_nvtx_annotate
@@ -504,15 +582,27 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         for i, kv_cache_pointer in enumerate(self.group_kv_cache_pointers_on_gpu):
             memory_obj_tensor = memory_obj.get_tensor(i)
             assert memory_obj_tensor is not None
-            lmc_ops.multi_layer_kv_transfer(
-                memory_obj_tensor,
-                kv_cache_pointer,
-                slot_mapping[start:end],
-                self.device,
-                self.page_buffer_size,
-                False,
-                self.use_mla,
-            )
+            if self.kv_cache_kv_second:
+                lmc_ops.multi_layer_kv_transfer_kv_second(
+                    memory_obj_tensor,
+                    kv_cache_pointer,
+                    slot_mapping[start:end],
+                    self.device,
+                    self.page_buffer_size,
+                    self.page_size,
+                    False,
+                    self.use_mla,
+                )
+            else:
+                lmc_ops.multi_layer_kv_transfer(
+                    memory_obj_tensor,
+                    kv_cache_pointer,
+                    slot_mapping[start:end],
+                    self.device,
+                    self.page_buffer_size,
+                    False,
+                    self.use_mla,
+                )
 
     @_lmcache_nvtx_annotate
     def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -532,15 +622,27 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 ):
                     memory_obj_tensor = memory_obj.get_tensor(i)
                     assert memory_obj_tensor is not None
-                    lmc_ops.multi_layer_kv_transfer(
-                        memory_obj_tensor,
-                        kv_cache_pointer,
-                        slot_mapping[start:end],
-                        self.device,
-                        self.page_buffer_size,
-                        True,
-                        self.use_mla,
-                    )
+                    if self.kv_cache_kv_second:
+                        lmc_ops.multi_layer_kv_transfer_kv_second(
+                            memory_obj_tensor,
+                            kv_cache_pointer,
+                            slot_mapping[start:end],
+                            self.device,
+                            self.page_buffer_size,
+                            self.page_size,
+                            True,
+                            self.use_mla,
+                        )
+                    else:
+                        lmc_ops.multi_layer_kv_transfer(
+                            memory_obj_tensor,
+                            kv_cache_pointer,
+                            slot_mapping[start:end],
+                            self.device,
+                            self.page_buffer_size,
+                            True,
+                            self.use_mla,
+                        )
             else:
                 # kvcaches -> gpu_buffer -> memobj
                 assert self.group_tmp_buffer is not None
@@ -548,15 +650,27 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                     self.group_kv_cache_pointers_on_gpu
                 ):
                     tmp_gpu_buffer = self.group_tmp_buffer[i][:, :, : end - start, :]
-                    lmc_ops.multi_layer_kv_transfer(
-                        tmp_gpu_buffer,
-                        kv_cache_pointer,
-                        slot_mapping[start:end],
-                        self.device,
-                        self.page_buffer_size,
-                        True,
-                        self.use_mla,
-                    )
+                    if self.kv_cache_kv_second:
+                        lmc_ops.multi_layer_kv_transfer_kv_second(
+                            tmp_gpu_buffer,
+                            kv_cache_pointer,
+                            slot_mapping[start:end],
+                            self.device,
+                            self.page_buffer_size,
+                            self.page_size,
+                            True,
+                            self.use_mla,
+                        )
+                    else:
+                        lmc_ops.multi_layer_kv_transfer(
+                            tmp_gpu_buffer,
+                            kv_cache_pointer,
+                            slot_mapping[start:end],
+                            self.device,
+                            self.page_buffer_size,
+                            True,
+                            self.use_mla,
+                        )
                     memory_obj_tensor = memory_obj.get_tensor(i)
                     assert memory_obj_tensor is not None
                     memory_obj_tensor.copy_(tmp_gpu_buffer, non_blocking=True)

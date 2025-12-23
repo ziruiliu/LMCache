@@ -285,6 +285,50 @@ __global__ void load_and_reshape_multi_layer_kernel(
   }
 }
 
+template <typename scalar_t, bool DIRECTION>
+__global__ void load_and_reshape_multi_layer_kernel_kv_second(
+    scalar_t* __restrict__ key_value,           // [2, num_layer, num_tokens,
+                                                // scalars_per_token]
+    scalar_t** __restrict__ paged_buffer_ptrs,  // [num_layers] *
+                                                // [num_pages, 2, page_size,
+                                                // scalars_per_token]
+    const int64_t* __restrict__ slot_mapping,   // [num_tokens]
+    const int scalars_per_token, const int num_tokens, const int num_layers,
+    const int page_size) {
+  const int token_id = blockIdx.x;
+  const int layer_id = blockIdx.y;
+  const int k_or_v = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int num_threads = blockDim.x;
+
+  const int64_t slot_idx = slot_mapping[token_id];
+  int64_t* paged_buffer_ptr = paged_buffer_ptrs[layer_id];
+
+  if (slot_idx < 0) {
+    return;
+  }
+
+  const int64_t page_idx = slot_idx / page_size;
+  const int64_t page_offset = slot_idx % page_size;
+
+  for (int i = tid; i < scalars_per_token; i += num_threads) {
+    const int64_t lmcache_offset =
+        key_value_offset(k_or_v, layer_id, token_id, i, scalars_per_token,
+                         num_tokens, num_layers);
+
+    const int64_t vllm_offset =
+        page_idx * (2 * page_size * scalars_per_token) +
+        k_or_v * (page_size * scalars_per_token) +
+        page_offset * scalars_per_token + i;
+
+    if (DIRECTION) {
+      key_value[lmcache_offset] = paged_buffer_ptr[vllm_offset];
+    } else {
+      paged_buffer_ptr[vllm_offset] = key_value[lmcache_offset];
+    }
+  }
+}
+
 /*
  * handle sglang MHA offload between CPU and GPU
  */
@@ -427,6 +471,51 @@ void multi_layer_kv_transfer(
         <<<grid, block, 0, stream>>>(key_value_ptr, page_buffer_ptrs,
                                      slot_mapping_ptr, num_qwords, num_tokens,
                                      num_layers, page_buffer_size);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+}
+
+void multi_layer_kv_transfer_kv_second(
+    torch::Tensor& key_value, const torch::Tensor& key_value_ptrs,
+    const torch::Tensor& slot_mapping, const torch::Device& paged_memory_device,
+    const int page_buffer_size, const int page_size, const bool direction,
+    const bool use_mla) {
+  if (use_mla) {
+    return multi_layer_kv_transfer(key_value, key_value_ptrs, slot_mapping,
+                                   paged_memory_device, page_buffer_size,
+                                   direction, use_mla);
+  }
+  (void)page_buffer_size;
+
+  int64_t* key_value_ptr = get_kernel_ptr<int64_t, torch::Tensor>(key_value);
+  int64_t** page_buffer_ptrs =
+      get_kernel_ptr<int64_t*, const torch::Tensor>(key_value_ptrs);
+  const int64_t* slot_mapping_ptr =
+      get_kernel_ptr<const int64_t, const torch::Tensor>(slot_mapping);
+
+  int num_layers = key_value.size(1);
+  int num_tokens = slot_mapping.size(0);
+  int num_origin_elements = key_value.size(3);
+  int elements_per_qword = 8 / key_value.element_size();
+  int num_qwords = num_origin_elements / elements_per_qword;
+
+  dim3 grid(key_value.size(2), num_layers, 2);
+  dim3 block(std::min(num_qwords, 128));
+
+  const at::cuda::OptionalCUDAGuard device_guard(paged_memory_device);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  if (not direction) {
+    lmc::load_and_reshape_multi_layer_kernel_kv_second<int64_t, false>
+        <<<grid, block, 0, stream>>>(key_value_ptr, page_buffer_ptrs,
+                                     slot_mapping_ptr, num_qwords, num_tokens,
+                                     num_layers, page_size);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  } else {
+    lmc::load_and_reshape_multi_layer_kernel_kv_second<int64_t, true>
+        <<<grid, block, 0, stream>>>(key_value_ptr, page_buffer_ptrs,
+                                     slot_mapping_ptr, num_qwords, num_tokens,
+                                     num_layers, page_size);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }

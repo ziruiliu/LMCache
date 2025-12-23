@@ -13,6 +13,8 @@ namespace py = pybind11;
 
 PYBIND11_MODULE(c_ops, m) {
   m.def("multi_layer_kv_transfer", &multi_layer_kv_transfer);
+  m.def("multi_layer_kv_transfer_kv_second",
+        &multi_layer_kv_transfer_kv_second);
   m.def("multi_layer_kv_transfer_unilateral",
         &multi_layer_kv_transfer_unilateral);
   m.def("single_layer_kv_transfer", &single_layer_kv_transfer);
