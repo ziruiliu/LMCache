@@ -9,6 +9,7 @@ import threading
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
     from vllm.multimodal.inputs import PlaceholderRange
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
 # Third Party
@@ -233,6 +234,31 @@ def create_lmcache_metadata(
     )
 
     return metadata, config
+
+
+def build_kv_cache_group_map(
+    kv_cache_config: Optional["KVCacheConfig"],
+) -> dict[str, int]:
+    """Build a mapping from layer names to KV cache group IDs."""
+    if kv_cache_config is None:
+        logger.debug("No kv_cache_config provided; kv_cache_group_map is empty.")
+        return {}
+
+    kv_cache_groups = getattr(kv_cache_config, "kv_cache_groups", None)
+    if not kv_cache_groups:
+        logger.debug("kv_cache_groups is empty; kv_cache_group_map is empty.")
+        return {}
+
+    kv_cache_group_map: dict[str, int] = {}
+    for group_id, kv_cache_group in enumerate(kv_cache_groups):
+        for layer_name in kv_cache_group.layer_names:
+            kv_cache_group_map[layer_name] = group_id
+    logger.debug(
+        "Built kv_cache_group_map for %d layers across %d groups.",
+        len(kv_cache_group_map),
+        len(kv_cache_groups),
+    )
+    return kv_cache_group_map
 
 
 def extract_mm_features(

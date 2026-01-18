@@ -31,6 +31,8 @@ class KVLayerGroupInfo:
     shape: torch.Size
     """ Data type of the KV cache tensor for layers in this group """
     dtype: torch.dtype
+    """ KV cache group ID (hybrid allocator), if known """
+    kv_cache_group_id: Optional[int] = None
 
     # Internal sets for fast membership checking
     _layer_indices_set: set[int] = field(init=False, repr=False)
@@ -46,10 +48,14 @@ class KVLayerGroupInfo:
             indices_repr = "[]"
         else:
             indices_repr = f"{self.layer_indices[0]}-{self.layer_indices[-1]}"
+        group_id_repr = (
+            "unknown" if self.kv_cache_group_id is None else self.kv_cache_group_id
+        )
         return (
             f"KVLayerGroupInfo(layers={len(self.layer_names)}, "
             f"indices={indices_repr}, "
-            f"shape={self.shape}, dtype={self.dtype})"
+            f"shape={self.shape}, dtype={self.dtype}, "
+            f"kv_cache_group_id={group_id_repr})"
         )
 
     @property
@@ -146,7 +152,11 @@ class KVLayerGroupsManager:
         group = self.get_group_by_layer_idx(layer_idx)
         return group.dtype if group else None
 
-    def build_kv_layer_groups(self, kv_caches: dict[str, torch.Tensor]) -> None:
+    def build_kv_layer_groups(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        kv_cache_group_map: Optional[dict[str, int]] = None,
+    ) -> None:
         """Build KV layer groups structure by analyzing each layer's shape and dtype.
 
         Layers with the same shape and dtype are grouped together. This is useful
@@ -167,15 +177,21 @@ class KVLayerGroupsManager:
             logger.debug("No KV caches available, skipping KV layer groups building")
             return
 
-        # Group layers by (shape, dtype) in a single loop
-        groups_dict: dict[tuple[torch.Size, torch.dtype], list[tuple[str, int]]] = (
-            defaultdict(list)
-        )
+        # Group layers by (shape, dtype, group_id) in a single loop. The
+        # optional group_id ensures hybrid KV cache groups stay isolated.
+        groups_dict: dict[
+            tuple[torch.Size, torch.dtype, Optional[int]], list[tuple[str, int]]
+        ] = defaultdict(list)
 
         for idx, (layer_name, kv_cache) in enumerate(kv_caches.items()):
             shape = kv_cache.shape
             dtype = kv_cache.dtype
-            key = (shape, dtype)
+            group_id = (
+                kv_cache_group_map.get(layer_name)
+                if kv_cache_group_map is not None
+                else None
+            )
+            key = (shape, dtype, group_id)
             groups_dict[key].append((layer_name, idx))
 
         # Build KVLayerGroupInfo list
@@ -192,8 +208,8 @@ class KVLayerGroupsManager:
         sorted_keys = sorted(groups_dict.keys(), key=_get_first_layer_index)
 
         kv_layer_groups: list[KVLayerGroupInfo] = []
-        for shape, dtype in sorted_keys:
-            layers = groups_dict[(shape, dtype)]
+        for shape, dtype, group_id in sorted_keys:
+            layers = groups_dict[(shape, dtype, group_id)]
             layer_names, layer_indices = zip(*layers, strict=False)
 
             group_info = KVLayerGroupInfo(
@@ -201,6 +217,7 @@ class KVLayerGroupsManager:
                 layer_indices=list(layer_indices),
                 shape=shape,
                 dtype=dtype,
+                kv_cache_group_id=group_id,
             )
             kv_layer_groups.append(group_info)
 
@@ -209,3 +226,8 @@ class KVLayerGroupsManager:
 
         # Print the group structure
         logger.info("KV layer groups: %s", kv_layer_groups)
+        logger.debug(
+            "Built %d KV layer groups (kv_cache_group_map=%s).",
+            len(kv_layer_groups),
+            "set" if kv_cache_group_map else "empty",
+        )

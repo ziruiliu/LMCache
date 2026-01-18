@@ -30,6 +30,7 @@ from lmcache import utils
 from lmcache.integration.vllm.utils import (
     ENGINE_NAME,
     apply_mm_hashes_to_token_ids,
+    build_kv_cache_group_map,
     extract_mm_features,
     lmcache_get_or_create_config,
 )
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import PlaceholderRange
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.sched.output import NewRequestData
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
     # First Party
@@ -436,6 +438,7 @@ class LMCacheConnectorV1Impl:
         vllm_config: "VllmConfig",
         role: KVConnectorRole,
         parent: KVConnectorBase_V1,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
     ):
         self._parent = parent
         self._vllm_config = vllm_config
@@ -465,6 +468,16 @@ class LMCacheConnectorV1Impl:
 
         # Initialize connector-specific state
         self._init_connector_state(role, vllm_config, config)
+
+        # Capture kv_cache_groups mapping once so all connectors share the same
+        # layer-to-group semantics for hybrid KV cache handling.
+        kv_cache_group_map = build_kv_cache_group_map(kv_cache_config)
+        if kv_cache_group_map and self.lmcache_engine_metadata is not None:
+            self.lmcache_engine_metadata.kv_cache_group_map = kv_cache_group_map
+            logger.debug(
+                "Stored kv_cache_group_map with %d entries in engine metadata.",
+                len(kv_cache_group_map),
+            )
 
         # Setup metrics for monitoring data structures
         self._setup_metrics()
@@ -700,7 +713,15 @@ class LMCacheConnectorV1Impl:
             kv_layer_groups_manager = (
                 self.lmcache_engine.metadata.kv_layer_groups_manager
             )
-            kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
+            logger.debug(
+                "Building KV layer groups for %d layers (kv_cache_group_map=%s).",
+                len(self.kv_caches),
+                "set" if self.lmcache_engine.metadata.kv_cache_group_map else "empty",
+            )
+            kv_layer_groups_manager.build_kv_layer_groups(
+                self.kv_caches,
+                kv_cache_group_map=self.lmcache_engine.metadata.kv_cache_group_map,
+            )
 
     # TODO(chunxiaozheng): in the latest lmcache_connector, we use `register_kv_caches`
     #  to init self.kv_caches, we keep it in order to be compatible with old versions
@@ -1571,10 +1592,9 @@ class LMCacheConnectorV1Impl:
         return meta
 
     @_lmcache_nvtx_annotate
-    def request_finished(
+    def _request_finished_impl(
         self,
         request: "Request",
-        block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED and self.async_loading:
@@ -1600,6 +1620,22 @@ class LMCacheConnectorV1Impl:
             }
 
         return False, return_params
+
+    @_lmcache_nvtx_annotate
+    def request_finished(
+        self,
+        request: "Request",
+        block_ids: list[int],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        return self._request_finished_impl(request)
+
+    @_lmcache_nvtx_annotate
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        return self._request_finished_impl(request)
 
     @_lmcache_nvtx_annotate
     def get_kv_events(self) -> Iterable[CacheStoreEvent]:

@@ -45,6 +45,8 @@ class LMCacheEngineMetadata:
     kv_layer_groups_manager: KVLayerGroupsManager = field(
         default_factory=KVLayerGroupsManager
     )
+    """ Mapping from layer names to KV cache group IDs (hybrid allocator). """
+    kv_cache_group_map: dict[str, int] = field(default_factory=dict)
     """ engine_id for RPC path (used by lookup client/server) """
     engine_id: Optional[str] = None
     """ total number of ranks (tensor_parallel_size * pipeline_parallel_size) """
