@@ -711,9 +711,13 @@ class LMCacheEngine:
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
         """
+        t_start = time.perf_counter()
+        req_id = kwargs.get("req_id", "unknown")
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping retrieve operation")
+            elapsed_ms = (time.perf_counter() - t_start) * 1000
+            logger.debug("Retrieve request %s took %.4f ms", req_id, elapsed_ms)
             return torch.zeros(len(tokens), dtype=torch.bool)
 
         assert self.gpu_connector is not None, (
@@ -818,6 +822,8 @@ class LMCacheEngine:
                 onload_time * 1000,
                 tot_kv_size / onload_time / 1024**3 if onload_time > 0 else 0,
             )
+        elapsed_ms = (time.perf_counter() - t_start) * 1000
+        logger.debug("Retrieve request %s took %.4f ms", req_id, elapsed_ms)
         return ret_mask
 
     @_lmcache_nvtx_annotate
@@ -1004,9 +1010,12 @@ class LMCacheEngine:
 
         :return: An int indicating how many prefix tokens exist inside LMCache.
         """
+        t_start = time.perf_counter()
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping lookup operation")
+            elapsed_ms = (time.perf_counter() - t_start) * 1000
+            logger.debug("Lookup request %s took %.4f ms", lookup_id, elapsed_ms)
             return 0
 
         assert self.storage_manager is not None
@@ -1086,6 +1095,8 @@ class LMCacheEngine:
             if pin:
                 # touch_cache is tightly coupled with batched_contains
                 self.storage_manager.touch_cache()
+            elapsed_ms = (time.perf_counter() - t_start) * 1000
+            logger.debug("Lookup request %s took %.4f ms", lookup_id, elapsed_ms)
 
     @_lmcache_nvtx_annotate
     def move(
