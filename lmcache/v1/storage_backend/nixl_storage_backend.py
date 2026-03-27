@@ -15,6 +15,7 @@
 
 # Standard
 from abc import ABC, abstractmethod
+from concurrent.futures import CancelledError, Future
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence, Set, Union, cast
 from urllib.parse import quote as url_quote
@@ -512,8 +513,79 @@ class NixlStorageBackend(AllocatorBackendInterface, ABC):
 
         self.progress_lock = threading.RLock()
         self.progress_set: Set[CacheEngineKey] = set()
+        self.pending_put_futures_lock = threading.RLock()
+        self.pending_put_futures: Set[Future[None]] = set()
 
         self.memory_allocator = self.initialize_allocator(config, metadata)
+
+    def _clear_put_progress(self, keys: Sequence[CacheEngineKey]) -> None:
+        with self.progress_lock:
+            for key in keys:
+                self.progress_set.discard(key)
+
+    def _invoke_on_complete_callback(
+        self,
+        key: CacheEngineKey,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]],
+    ) -> None:
+        if on_complete_callback is None:
+            return
+        try:
+            on_complete_callback(key)
+        except Exception as e:
+            logger.warning(f"on_complete_callback failed for key {key}: {e}")
+
+    def _track_async_put_future(
+        self, future: Future[None], keys: Sequence[CacheEngineKey]
+    ) -> None:
+        with self.pending_put_futures_lock:
+            self.pending_put_futures.add(future)
+
+        key_hashes = [f"{key.chunk_hash:x}" for key in keys]
+
+        def _done_callback(done_future: Future[None]) -> None:
+            with self.pending_put_futures_lock:
+                self.pending_put_futures.discard(done_future)
+            try:
+                done_future.result()
+            except CancelledError:
+                logger.warning(
+                    "Async NIXL put task was cancelled for keys: %s", key_hashes
+                )
+            except Exception:
+                logger.exception("Async NIXL put task failed for keys: %s", key_hashes)
+
+        future.add_done_callback(_done_callback)
+
+    def _drain_pending_put_futures(self) -> None:
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        if running_loop is self.loop:
+            logger.warning(
+                "Skipping drain of pending async NIXL put tasks from the backend "
+                "event loop thread during close()."
+            )
+            return
+
+        with self.pending_put_futures_lock:
+            pending_futures = list(self.pending_put_futures)
+
+        if pending_futures:
+            logger.info(
+                "Waiting for %d pending async NIXL put task(s) before close().",
+                len(pending_futures),
+            )
+
+        for future in pending_futures:
+            try:
+                future.result()
+            except CancelledError:
+                logger.warning("Async NIXL put task cancelled during close().")
+            except Exception:
+                logger.exception("Async NIXL put task failed during close().")
 
     def initialize_allocator(
         self,
@@ -1135,9 +1207,11 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         storage_reg_descs: nixlBind.nixlRegDList,
         storage_xfer_handler: NixlDlistHandle,
         mem_objs: List[MemoryObj],
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ):
         """Asynchronously wait for transfer to complete without blocking."""
         state = ""
+        key_hashes = [f"{key.chunk_hash:x}" for key in keys]
         try:
             state = initial_state
             while state != "DONE" and state != "ERR":
@@ -1145,23 +1219,52 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
                 await asyncio.sleep(0.001)  # Avoid busy-waiting, yield to event loop
             if state == "ERR":
                 raise RuntimeError("NIXL transfer failed")
+            logger.debug("Async NIXL put completed for keys: %s", key_hashes)
+        except asyncio.CancelledError:
+            logger.warning("Async NIXL put cancelled for keys: %s", key_hashes)
+            raise
+        except Exception:
+            logger.exception("Async NIXL put failed for keys: %s", key_hashes)
+            raise
 
         finally:
             # Release the handle after transfer completes (success or failure)
-            self.agent.release_handle(handle)
-            self.agent.release_storage_handler(storage_reg_descs, storage_xfer_handler)
+            self._clear_put_progress(keys)
+
+            try:
+                self.agent.release_handle(handle)
+            except Exception:
+                logger.exception(
+                    "Failed to release async NIXL transfer handle for keys: %s",
+                    key_hashes,
+                )
+
+            try:
+                self.agent.release_storage_handler(
+                    storage_reg_descs, storage_xfer_handler
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to release async NIXL storage handler for keys: %s",
+                    key_hashes,
+                )
 
             if state == "DONE":
                 for key in keys:
-                    with self.progress_lock:
-                        self.progress_set.discard(key)
                     self._cache_add(key.chunk_hash)
+                    self._invoke_on_complete_callback(key, on_complete_callback)
+            else:
+                for key in keys:
+                    self._cache_discard(key.chunk_hash)
 
             for mem_obj in mem_objs:
                 mem_obj.ref_count_down()
 
     async def mem_to_storage(
-        self, keys: Sequence[CacheEngineKey], mem_objs: List[MemoryObj]
+        self,
+        keys: Sequence[CacheEngineKey],
+        mem_objs: List[MemoryObj],
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
         start_time = time.time()
         if len(keys) == 0:
@@ -1180,43 +1283,74 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
             # Already validated in validate_nixl_backend
             raise ValueError(f"unexpected mem_type: {self.agent.mem_type}")
 
-        storage_reg_descs, storage_xfer_handler = (
-            self.agent.create_batched_storage_handler(descs, page_size)
-        )
+        storage_reg_descs = None
+        storage_xfer_handler = None
+        handle = None
+        transfer_wait_started = False
 
-        handle = self.agent.get_mem_to_storage_handle(
-            mem_indices, storage_xfer_handler, storage_indices
-        )
+        try:
+            storage_reg_descs, storage_xfer_handler = (
+                self.agent.create_batched_storage_handler(descs, page_size)
+            )
 
-        if self.async_mode:
-            initial_state = self.agent.post_async(handle)
-            # Submit the async wait to the event loop and return immediately
-            asyncio.create_task(
-                self._wait_for_transfer(
+            handle = self.agent.get_mem_to_storage_handle(
+                mem_indices, storage_xfer_handler, storage_indices
+            )
+
+            if self.async_mode:
+                initial_state = self.agent.post_async(handle)
+                transfer_wait_started = True
+                await self._wait_for_transfer(
                     handle,
                     initial_state,
                     keys,
                     storage_reg_descs,
                     storage_xfer_handler,
                     mem_objs,
+                    on_complete_callback,
                 )
-            )
-        else:
-            self.agent.post_blocking(handle)
-            self.agent.release_handle(handle)
-            self.agent.release_storage_handler(storage_reg_descs, storage_xfer_handler)
+            else:
+                self.agent.post_blocking(handle)
+                self.agent.release_handle(handle)
+                self.agent.release_storage_handler(
+                    storage_reg_descs, storage_xfer_handler
+                )
 
-            end_time = time.time()
-            duration = end_time - start_time
-            logger.debug(
-                f"mem_to_storage for {len(keys)} objects size {page_size * len(keys)} "
-                f"took {duration:.3f} seconds"
-            )
+                end_time = time.time()
+                duration = end_time - start_time
+                logger.debug(
+                    f"mem_to_storage for {len(keys)} objects size "
+                    f"{page_size * len(keys)} took {duration:.3f} seconds"
+                )
 
-            for key in keys:
-                with self.progress_lock:
-                    self.progress_set.discard(key)
-                self._cache_add(key.chunk_hash)
+                self._clear_put_progress(keys)
+                for key in keys:
+                    self._cache_add(key.chunk_hash)
+        except Exception:
+            if self.async_mode and not transfer_wait_started:
+                self._clear_put_progress(keys)
+                for key in keys:
+                    self._cache_discard(key.chunk_hash)
+                for mem_obj in mem_objs:
+                    mem_obj.ref_count_down()
+
+            if handle is not None and not transfer_wait_started:
+                try:
+                    self.agent.release_handle(handle)
+                except Exception:
+                    logger.exception("Failed to release NIXL transfer handle")
+            if (
+                storage_reg_descs is not None
+                and storage_xfer_handler is not None
+                and not transfer_wait_started
+            ):
+                try:
+                    self.agent.release_storage_handler(
+                        storage_reg_descs, storage_xfer_handler
+                    )
+                except Exception:
+                    logger.exception("Failed to release NIXL storage handler")
+            raise
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         """
@@ -1306,25 +1440,28 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         if self.async_mode:
             for mem_obj in memory_objs:
                 mem_obj.ref_count_up()
-            asyncio.run_coroutine_threadsafe(
-                self.mem_to_storage(keys, memory_objs), self.loop
+            future = asyncio.run_coroutine_threadsafe(
+                self.mem_to_storage(
+                    keys,
+                    memory_objs,
+                    on_complete_callback=on_complete_callback,
+                ),
+                self.loop,
             )
-            # Note: callback not supported in async mode
+            self._track_async_put_future(future, keys)
         else:
             future = asyncio.run_coroutine_threadsafe(
-                self.mem_to_storage(keys, memory_objs), self.loop
+                self.mem_to_storage(
+                    keys,
+                    memory_objs,
+                    on_complete_callback=on_complete_callback,
+                ),
+                self.loop,
             )
             future.result()
 
-            # Call completion callback for sync mode
-            if on_complete_callback is not None:
-                for key in keys:
-                    try:
-                        on_complete_callback(key)
-                    except Exception as e:
-                        logger.warning(
-                            f"on_complete_callback failed for key {key}: {e}"
-                        )
+            for key in keys:
+                self._invoke_on_complete_callback(key, on_complete_callback)
 
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         """
@@ -1393,6 +1530,7 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         """
         Close the storage backend.
         """
+        self._drain_pending_put_futures()
         self.agent.close()
         self.memory_allocator.close()
 

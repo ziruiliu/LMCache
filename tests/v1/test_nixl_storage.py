@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from pathlib import Path
+from types import SimpleNamespace
 import asyncio
 import threading
 
@@ -16,7 +17,11 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import PagedTensorMemoryAllocator
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend import CreateStorageBackends
-from lmcache.v1.storage_backend.nixl_storage_backend import NixlStorageBackend
+from lmcache.v1.storage_backend.nixl_storage_backend import (
+    NixlDynamicStorageBackend,
+    NixlStorageBackend,
+    SetPresenceCache,
+)
 
 
 def create_key(chunk_hash: str):
@@ -27,6 +32,68 @@ def create_key(chunk_hash: str):
         chunk_hash=int(chunk_hash, base=16),
         dtype=torch.bfloat16,
     )
+
+
+class FakeAsyncMemObj:
+    def __init__(self, address: int):
+        self.meta = SimpleNamespace(address=address)
+        self.ref_count = 0
+
+    def ref_count_up(self) -> None:
+        self.ref_count += 1
+
+    def ref_count_down(self) -> None:
+        self.ref_count -= 1
+
+
+class FakeAsyncAgent:
+    mem_type = "OBJ"
+
+    def __init__(self, states: list[str], post_async_state: str = "PENDING"):
+        self.nixl_agent = self
+        self._states = list(states)
+        self._post_async_state = post_async_state
+        self.release_handle_calls = 0
+        self.release_storage_handler_calls = 0
+
+    def create_batched_storage_handler(self, descs, page_size):
+        return "reg_descs", "xfer_handler"
+
+    def get_mem_to_storage_handle(
+        self, mem_indices, storage_xfer_handler, storage_indices
+    ):
+        return "handle"
+
+    def post_async(self, handle):
+        return self._post_async_state
+
+    def check_xfer_state(self, handle):
+        assert self._states, "check_xfer_state called with no remaining fake states"
+        return self._states.pop(0)
+
+    def release_handle(self, handle) -> None:
+        self.release_handle_calls += 1
+
+    def release_storage_handler(self, reg_descs, xfer_handler) -> None:
+        self.release_storage_handler_calls += 1
+
+
+def create_fake_dynamic_backend(agent: FakeAsyncAgent) -> NixlDynamicStorageBackend:
+    backend = object.__new__(NixlDynamicStorageBackend)
+    backend.loop = asyncio.new_event_loop()
+    backend.key_lock = threading.RLock()
+    backend.progress_lock = threading.RLock()
+    backend.progress_set = set()
+    backend.pending_put_futures_lock = threading.RLock()
+    backend.pending_put_futures = set()
+    backend.async_mode = True
+    backend.enable_presence_cache = True
+    backend.hit_counter = 0
+    backend.total_counter = 0
+    backend.key_presence_cache = SetPresenceCache()
+    backend.memory_allocator = SimpleNamespace(align_bytes=4096)
+    backend.agent = agent
+    return backend
 
 
 def run(config: LMCacheEngineConfig, shape, dtype):
@@ -182,6 +249,65 @@ def run(config: LMCacheEngineConfig, shape, dtype):
             thread_loop.call_soon_threadsafe(thread_loop.stop)
         if thread and thread.is_alive():
             thread.join()
+
+
+@pytest.mark.no_shared_allocator
+def test_nixl_dynamic_async_put_invokes_callback_on_success():
+    key = create_key("1")
+    mem_obj = FakeAsyncMemObj(address=11)
+    mem_obj.ref_count_up()
+    agent = FakeAsyncAgent(states=["DONE"])
+    backend = create_fake_dynamic_backend(agent)
+    backend.progress_set.add(key)
+    callback_keys: list[CacheEngineKey] = []
+
+    try:
+        asyncio.run(
+            backend.mem_to_storage(
+                [key],
+                [mem_obj],
+                on_complete_callback=callback_keys.append,
+            )
+        )
+    finally:
+        backend.loop.close()
+
+    assert callback_keys == [key]
+    assert mem_obj.ref_count == 0
+    assert not backend.exists_in_put_tasks(key)
+    assert backend.contains(key)
+    assert agent.release_handle_calls == 1
+    assert agent.release_storage_handler_calls == 1
+
+
+@pytest.mark.no_shared_allocator
+def test_nixl_dynamic_async_put_failure_clears_progress_and_refcount():
+    key = create_key("2")
+    mem_obj = FakeAsyncMemObj(address=22)
+    mem_obj.ref_count_up()
+    agent = FakeAsyncAgent(states=["ERR"])
+    backend = create_fake_dynamic_backend(agent)
+    backend.progress_set.add(key)
+    callback_keys: list[CacheEngineKey] = []
+
+    try:
+        with pytest.raises(RuntimeError, match="NIXL transfer failed"):
+            asyncio.run(
+                backend.mem_to_storage(
+                    [key],
+                    [mem_obj],
+                    on_complete_callback=callback_keys.append,
+                )
+            )
+    finally:
+        backend.loop.close()
+
+    assert callback_keys == []
+    assert mem_obj.ref_count == 0
+    assert not backend.exists_in_put_tasks(key)
+    assert not backend._cache_contains(key.chunk_hash)
+    assert agent.release_handle_calls == 1
+    assert agent.release_storage_handler_calls == 1
 
 
 @pytest.mark.no_shared_allocator
