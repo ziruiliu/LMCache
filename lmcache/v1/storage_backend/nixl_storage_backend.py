@@ -1111,6 +1111,11 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         # URL encode for safety
         return url_quote(flat_key_str, safe="")
 
+    def _get_object_device_id(self, key: CacheEngineKey) -> int:
+        """Use the formatted object key to derive a stable device id."""
+        object_key = self._format_object_key(key)
+        return int.from_bytes(object_key.encode()[:8], byteorder="little")
+
     def key_exists(self, key: CacheEngineKey) -> bool:
         if self.agent.mem_type == "OBJ":
             meta_info = self._format_object_key(key)
@@ -1153,7 +1158,14 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         if self.agent.mem_type == "OBJ":
             for idx in range(len(keys)):
                 object_key = self._format_object_key(keys[idx])
-                descs.append(NixlDesc(device_id=idx, meta_info=object_key))
+                # Use a key-derived id to keep overlapping transfers from
+                # reusing the same batch-local device ids.
+                descs.append(
+                    NixlDesc(
+                        device_id=self._get_object_device_id(keys[idx]),
+                        meta_info=object_key,
+                    )
+                )
         else:
             # Already validated in validate_nixl_backend
             raise ValueError(f"unexpected mem_type: {self.agent.mem_type}")
@@ -1278,7 +1290,14 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
         if self.agent.mem_type == "OBJ":
             for idx in range(len(keys)):
                 object_key = self._format_object_key(keys[idx])
-                descs.append(NixlDesc(device_id=idx, meta_info=object_key))
+                # Use a key-derived id to keep overlapping transfers from
+                # reusing the same batch-local device ids.
+                descs.append(
+                    NixlDesc(
+                        device_id=self._get_object_device_id(keys[idx]),
+                        meta_info=object_key,
+                    )
+                )
         else:
             # Already validated in validate_nixl_backend
             raise ValueError(f"unexpected mem_type: {self.agent.mem_type}")

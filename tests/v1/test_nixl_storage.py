@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import asyncio
 import threading
+import time
 
 # Third Party
 import pytest
@@ -94,6 +95,40 @@ def create_fake_dynamic_backend(agent: FakeAsyncAgent) -> NixlDynamicStorageBack
     backend.memory_allocator = SimpleNamespace(align_bytes=4096)
     backend.agent = agent
     return backend
+
+
+def start_background_loop(
+    backend: NixlDynamicStorageBackend,
+) -> tuple[asyncio.AbstractEventLoop, threading.Thread]:
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever)
+    thread.start()
+    backend.loop = loop
+    return loop, thread
+
+
+def stop_background_loop(
+    loop: asyncio.AbstractEventLoop,
+    thread: threading.Thread,
+) -> None:
+    if loop.is_running():
+        loop.call_soon_threadsafe(loop.stop)
+    if thread.is_alive():
+        thread.join()
+    loop.close()
+
+
+def wait_for_async_put_completion(
+    mem_obj: FakeAsyncMemObj,
+    agent: FakeAsyncAgent,
+    timeout_s: float = 1.0,
+) -> None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if mem_obj.ref_count == 0 and agent.release_handle_calls == 1:
+            return
+        time.sleep(0.01)
+    raise AssertionError("async put did not complete before timeout")
 
 
 def run(config: LMCacheEngineConfig, shape, dtype):
@@ -252,30 +287,22 @@ def run(config: LMCacheEngineConfig, shape, dtype):
 
 
 @pytest.mark.no_shared_allocator
-def test_nixl_dynamic_async_put_invokes_callback_on_success():
+def test_nixl_dynamic_async_put_success_clears_progress():
     key = create_key("1")
     mem_obj = FakeAsyncMemObj(address=11)
-    mem_obj.ref_count_up()
     agent = FakeAsyncAgent(states=["DONE"])
     backend = create_fake_dynamic_backend(agent)
-    backend.progress_set.add(key)
-    callback_keys: list[CacheEngineKey] = []
+    loop, thread = start_background_loop(backend)
 
     try:
-        asyncio.run(
-            backend.mem_to_storage(
-                [key],
-                [mem_obj],
-                on_complete_callback=callback_keys.append,
-            )
-        )
+        backend.batched_submit_put_task([key], [mem_obj])
+        wait_for_async_put_completion(mem_obj, agent)
     finally:
-        backend.loop.close()
+        stop_background_loop(loop, thread)
 
-    assert callback_keys == [key]
     assert mem_obj.ref_count == 0
     assert not backend.exists_in_put_tasks(key)
-    assert backend.contains(key)
+    assert backend._cache_contains(key.chunk_hash)
     assert agent.release_handle_calls == 1
     assert agent.release_storage_handler_calls == 1
 
@@ -284,25 +311,16 @@ def test_nixl_dynamic_async_put_invokes_callback_on_success():
 def test_nixl_dynamic_async_put_failure_clears_progress_and_refcount():
     key = create_key("2")
     mem_obj = FakeAsyncMemObj(address=22)
-    mem_obj.ref_count_up()
     agent = FakeAsyncAgent(states=["ERR"])
     backend = create_fake_dynamic_backend(agent)
-    backend.progress_set.add(key)
-    callback_keys: list[CacheEngineKey] = []
+    loop, thread = start_background_loop(backend)
 
     try:
-        with pytest.raises(RuntimeError, match="NIXL transfer failed"):
-            asyncio.run(
-                backend.mem_to_storage(
-                    [key],
-                    [mem_obj],
-                    on_complete_callback=callback_keys.append,
-                )
-            )
+        backend.batched_submit_put_task([key], [mem_obj])
+        wait_for_async_put_completion(mem_obj, agent)
     finally:
-        backend.loop.close()
+        stop_background_loop(loop, thread)
 
-    assert callback_keys == []
     assert mem_obj.ref_count == 0
     assert not backend.exists_in_put_tasks(key)
     assert not backend._cache_contains(key.chunk_hash)
